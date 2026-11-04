@@ -1,0 +1,5 @@
+config.ini
+proxy.log
+__pycache__/
+*.pyc
+.venv/
