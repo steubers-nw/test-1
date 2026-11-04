@@ -1,7 +1,0 @@
-2026-11-02 14:43:52 BOOT listen=0.0.0.0:8327 keys=1 models=12 thinking=strip/high
-2026-11-02 14:43:59 REQ  0cb42e 127.0.0.1 model=4a -> google/gemini-4-argon stream=0 msgs=1 effort=medium keys=1 bytes=203
-2026-11-02 14:44:10 KEY  0cb42e ok sk_liv...jgb2 (attempt 1)
-2026-11-02 14:44:10 DONE 0cb42e 200 chars=35 bytes=410 elapsed=10.90s key=sk_liv...jgb2 upstream_req=req_p44jvj75zft025fdhapq42qyeb
-2026-11-02 14:45:39 REQ  86b68e 127.0.0.1 model=5.5o -> anthropic/claude-opus-5.5 stream=0 msgs=1 effort=high keys=1 bytes=75
-2026-11-02 14:45:44 KEY  86b68e ok sk_liv...jgb2 (attempt 1)
-2026-11-02 14:45:44 DONE 86b68e 200 chars=35 bytes=414 elapsed=4.76s key=sk_liv...jgb2 upstream_req=req_t7c9hadm3wvqwynpxyb4jvrq98
