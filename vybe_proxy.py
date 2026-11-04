@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-vybe_proxy.py — vybe.build → OpenAI 兼容协议代理（多 Cookie 池版）
+vybe_proxy.py — vybe.build → OpenAI 兼容协议代理（多 Cookie + 多 Channel 版）
 
-基于 steubers-nw/test-1 的 vetta_proxy.py 骨架改造。
-仅依赖 Python 标准库。
+上游层级：Agent → Channel → Thread → Message
 """
 from __future__ import annotations
 
@@ -28,7 +27,6 @@ from typing import Any
 
 class Config:
     def __init__(self, path: str):
-        # 关键：interpolation=None 关闭 % 插值，避免 session_token 里的 %2B/%3D 报错
         cp = configparser.ConfigParser(interpolation=None)
         if not os.path.exists(path):
             raise SystemExit(f"config file not found: {path}")
@@ -54,12 +52,21 @@ class Config:
             name = section[len("cookie:"):].strip()
             if not name:
                 raise SystemExit(f"[{section}] empty cookie name")
-            token    = cp.get(section, "session_token", fallback="").strip()
-            agent_id = cp.get(section, "agent_id", fallback="").strip()
-            enabled  = cp.getboolean(section, "enabled", fallback=True)
-            if not token or not agent_id:
-                raise SystemExit(f"[{section}] missing session_token or agent_id")
-            self.cookies.append(CookieEntry(name, token, agent_id, enabled))
+            token      = cp.get(section, "session_token", fallback="").strip()
+            agent_id   = cp.get(section, "agent_id",   fallback="").strip()
+            channel_id = cp.get(section, "channel_id", fallback="").strip()
+            user_id    = cp.get(section, "user_id",    fallback="").strip()
+            user_name  = cp.get(section, "user_name",  fallback="").strip()
+            user_image = cp.get(section, "user_image", fallback="").strip()
+            enabled    = cp.getboolean(section, "enabled", fallback=True)
+            if not token or not agent_id or not channel_id or not user_id:
+                raise SystemExit(
+                    f"[{section}] missing one of: session_token / agent_id / channel_id / user_id"
+                )
+            self.cookies.append(CookieEntry(
+                name, token, agent_id, channel_id,
+                user_id, user_name, user_image, enabled,
+            ))
 
         if not self.cookies:
             raise SystemExit("no [cookie:xxx] sections found")
@@ -96,16 +103,22 @@ class Logger:
 # =========================================================
 
 class CookieEntry:
-    """一个账户 = 一组 (session_token, agent_id)。"""
+    """一个账户 = (session_token, agent_id, channel_id, user_id, user_name, user_image)。"""
     __slots__ = (
-        "name", "session_token", "agent_id", "enabled",
+        "name", "session_token", "agent_id", "channel_id",
+        "user_id", "user_name", "user_image", "enabled",
         "cooldown_until", "fail_count", "last_error", "_lock",
     )
 
-    def __init__(self, name: str, session_token: str, agent_id: str, enabled: bool):
+    def __init__(self, name, session_token, agent_id, channel_id,
+                 user_id, user_name, user_image, enabled):
         self.name = name
         self.session_token = session_token
         self.agent_id = agent_id
+        self.channel_id = channel_id
+        self.user_id = user_id
+        self.user_name = user_name
+        self.user_image = user_image
         self.enabled = enabled
         self.cooldown_until = 0.0
         self.fail_count = 0
@@ -123,19 +136,16 @@ class CookieEntry:
             self.last_error = ""
 
     def mark_auth_failed(self, msg: str):
-        """401：会话失效，永久禁用（需人工恢复）。"""
         with self._lock:
             self.enabled = False
             self.last_error = f"auth: {msg[:200]}"
 
     def mark_quota_exhausted(self, msg: str, cooldown: int):
-        """402/429：额度耗尽 / 限流，冷却一段时间后自动恢复。"""
         with self._lock:
             self.cooldown_until = time.time() + cooldown
             self.last_error = f"quota: {msg[:200]}"
 
     def mark_transient_fail(self, msg: str, max_fails: int, cooldown: int):
-        """5xx / 网络错误：累计失败，达阈值后冷却。"""
         with self._lock:
             self.fail_count += 1
             self.last_error = f"fail: {msg[:200]}"
@@ -147,6 +157,8 @@ class CookieEntry:
         return {
             "name": self.name,
             "agent_id": self.agent_id,
+            "channel_id": self.channel_id,
+            "user_id": self.user_id,
             "enabled": self.enabled,
             "available": self.available(),
             "cooldown_remaining": max(0, int(self.cooldown_until - time.time())),
@@ -162,15 +174,10 @@ class CookiePool:
         self._rr = 0
         self._lock = threading.Lock()
 
-    def get(self, name: str) -> CookieEntry | None:
+    def get(self, name):
         return self._by_name.get(name)
 
     def available_entries(self, preferred: str | None = None) -> list[CookieEntry]:
-        """
-        当前可用 cookie 列表，按优先级排序：
-          - preferred（若可用）放最前
-          - 其余从 round-robin 游标开始轮转
-        """
         with self._lock:
             n = len(self._entries)
             start = self._rr
@@ -191,9 +198,6 @@ class CookiePool:
 
     def status(self) -> list[dict]:
         return [e.snapshot() for e in self._entries]
-
-    def any_available(self) -> bool:
-        return any(e.available() for e in self._entries)
 
 
 # =========================================================
@@ -236,18 +240,30 @@ def _thread_key(messages: list) -> str:
     return uuid.uuid4().hex[:16]
 
 
-def _build_vybe_payload(thread_id: str, user_text: str, system_text: str) -> dict:
-    """构造 vybe UIMessage 请求体（有状态，只发当前消息）。"""
+def _build_vybe_payload(thread_id: str, user_text: str, system_text: str,
+                        cookie: CookieEntry) -> dict:
     text = user_text
     if system_text:
         text = f"[System instructions]\n{system_text}\n\n[User]\n{user_text}"
+
+    user_obj: dict = {"id": cookie.user_id}
+    if cookie.user_name:
+        user_obj["name"] = cookie.user_name
+    if cookie.user_image:
+        user_obj["image"] = cookie.user_image
+
     return {
         "trigger": "submit-message",
         "id": thread_id,
         "message": {
             "id": str(uuid.uuid4()),
             "parts": [{"type": "text", "text": text}],
-            "metadata": {"createdAt": int(time.time() * 1000)},
+            "metadata": {
+                "createdAt": int(time.time() * 1000),
+                "timeZone": "Asia/Shanghai",
+                "userId": cookie.user_id,
+                "user": user_obj,
+            },
             "role": "user",
         },
     }
@@ -277,6 +293,7 @@ def _parse_sse_line(line: str) -> dict | None:
 
 class UpstreamAuthError(Exception): pass
 class UpstreamQuotaError(Exception): pass
+class UpstreamThreadNotFoundError(Exception): pass
 
 
 class UpstreamGenericError(Exception):
@@ -295,29 +312,73 @@ class Upstream:
         self.cfg = cfg
         self.logger = logger
 
-    def open_stream(self, cookie: CookieEntry, thread_id: str, payload: dict):
-        """对单个 cookie 发起一次 POST /chat。成功返回 response，失败抛分类异常。"""
-        url = f"{self.cfg.upstream_url}/api/agents/{cookie.agent_id}/threads/{thread_id}/chat"
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header(
-            "Cookie",
-            f"__Secure-better-auth.session_token={cookie.session_token}"
+    def _headers(self, cookie: CookieEntry) -> dict:
+        return {
+            "Cookie": f"__Secure-better-auth.session_token={cookie.session_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _classify_http_error(self, e: urllib.error.HTTPError, body: str):
+        """把 HTTPError 转成分类异常。"""
+        if e.code == 401:
+            raise UpstreamAuthError(f"session expired: {body[:200]}") from e
+        if e.code in (402, 429):
+            raise UpstreamQuotaError(f"quota/rate: {body[:200]}") from e
+        if e.code == 404:
+            try:
+                obj = json.loads(body)
+                err = (obj.get("error") or "").lower()
+                if "thread" in err:
+                    raise UpstreamThreadNotFoundError(body[:200]) from e
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        raise UpstreamGenericError(e.code, body) from e
+
+    def create_thread(self, cookie: CookieEntry) -> str:
+        """创建空 thread，返回 threadId。"""
+        tid = str(uuid.uuid4())
+        url = (
+            f"{self.cfg.upstream_url}/api/agents/{cookie.agent_id}"
+            f"/channels/{cookie.channel_id}/threads"
         )
-        req.add_header("Content-Type", "application/json")
+        body = json.dumps({"id": tid, "initial": False}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        for k, v in self._headers(cookie).items():
+            req.add_header(k, v)
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+            resp.read()      # 读掉响应体，确保连接正常关闭
+            resp.close()
+            return tid
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            self._classify_http_error(e, err_body)
+            raise  # 不会到达
+        except urllib.error.URLError as e:
+            raise UpstreamGenericError(502, f"network: {e.reason}") from e
+
+    def open_stream(self, cookie: CookieEntry, thread_id: str, payload: dict):
+        url = (
+            f"{self.cfg.upstream_url}/api/agents/{cookie.agent_id}"
+            f"/threads/{thread_id}/chat"
+        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        for k, v in self._headers(cookie).items():
+            req.add_header(k, v)
         req.add_header("Accept", "text/event-stream")
         try:
             return urllib.request.urlopen(req, timeout=self.cfg.timeout)
         except urllib.error.HTTPError as e:
             try:
-                body = e.read().decode("utf-8", errors="replace")
+                err_body = e.read().decode("utf-8", errors="replace")
             except Exception:
-                body = ""
-            if e.code == 401:
-                raise UpstreamAuthError(f"session expired: {body[:200]}") from e
-            if e.code in (402, 429):
-                raise UpstreamQuotaError(f"quota/rate: {body[:200]}") from e
-            raise UpstreamGenericError(e.code, body) from e
+                err_body = ""
+            self._classify_http_error(e, err_body)
+            raise  # 不会到达
         except urllib.error.URLError as e:
             raise UpstreamGenericError(502, f"network: {e.reason}") from e
 
@@ -328,12 +389,12 @@ class Upstream:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "vybe-proxy/2.0"
+    server_version = "vybe-proxy/3.0"
 
-    cfg: Config = None          # type: ignore
-    logger: Logger = None       # type: ignore
-    upstream: Upstream = None   # type: ignore
-    pool: CookiePool = None     # type: ignore
+    cfg: Config = None
+    logger: Logger = None
+    upstream: Upstream = None
+    pool: CookiePool = None
 
     # thread_key -> (cookie_name, thread_id)
     _threads: dict[str, tuple[str, str]] = {}
@@ -438,28 +499,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._err(404, "not_found", f"no route for POST {path}")
 
-    # -------- thread 绑定 --------
+    # -------- thread 生命周期 --------
 
-    def _resolve_thread(self, thread_key: str, cookie_name: str) -> str:
+    def _resolve_thread(self, thread_key: str, cookie: CookieEntry) -> str:
         """
-        返回该对话在此 cookie 下的 thread_id。
-        绑定存在且 cookie 一致 → 复用；否则新建并更新绑定。
-        切换 cookie 会自动换 thread（上下文重置）。
+        返回对话在指定 cookie 下可用的 threadId。
+        - 绑定存在且 cookie 一致 → 复用
+        - 否则 → 调上游 create_thread 拿真实 threadId，再绑定
         """
+        # 快路径
         with self._threads_lock:
             binding = self._threads.get(thread_key)
-            if binding and binding[0] == cookie_name:
+            if binding and binding[0] == cookie.name:
+                return binding[1]
+
+        # 慢路径：创建新 thread
+        tid = self.upstream.create_thread(cookie)
+
+        # 写入绑定（双重检查，避免并发重复）
+        with self._threads_lock:
+            binding = self._threads.get(thread_key)
+            if binding and binding[0] == cookie.name:
                 return binding[1]
             if len(self._threads) >= self._thread_max:
                 try:
                     self._threads.pop(next(iter(self._threads)))
                 except StopIteration:
                     pass
-            tid = str(uuid.uuid4())
-            self._threads[thread_key] = (cookie_name, tid)
-            return tid
+            self._threads[thread_key] = (cookie.name, tid)
+        self.logger.info(f"created thread cookie={cookie.name} tid={tid[:8]}...")
+        return tid
 
-    def _bindings_snapshot(self, thread_key: str) -> tuple[str, str] | None:
+    def _clear_binding(self, thread_key: str, cookie_name: str):
+        with self._threads_lock:
+            binding = self._threads.get(thread_key)
+            if binding and binding[0] == cookie_name:
+                del self._threads[thread_key]
+
+    def _bindings_snapshot(self, thread_key: str):
         with self._threads_lock:
             return self._threads.get(thread_key)
 
@@ -486,26 +563,19 @@ class Handler(BaseHTTPRequestHandler):
         model_name = body.get("model") or "vybe"
         thread_key = _thread_key(messages)
 
-        # 优先选之前绑定的 cookie（若有）
         binding = self._bindings_snapshot(thread_key)
         preferred = binding[0] if binding else None
 
         resp = self._open_with_failover(thread_key, preferred, user_text, system_text)
         if resp is None:
-            return  # _open_with_failover 已写错误响应
+            return
 
         if stream:
             self._relay_stream(resp, model_name)
         else:
             self._relay_json(resp, model_name)
 
-    def _open_with_failover(
-        self, thread_key: str, preferred: str | None,
-        user_text: str, system_text: str,
-    ):
-        """
-        按池中的可用列表逐个尝试。成功返回 response；全部失败写错误响应并返回 None。
-        """
+    def _open_with_failover(self, thread_key, preferred, user_text, system_text):
         candidates = self.pool.available_entries(preferred)
         if not candidates:
             self._err(503, "no_cookie",
@@ -515,21 +585,37 @@ class Handler(BaseHTTPRequestHandler):
         last_error: tuple[str, int, str] | None = None
 
         for cookie in candidates:
-            thread_id = self._resolve_thread(thread_key, cookie.name)
-            payload = _build_vybe_payload(thread_id, user_text, system_text)
             try:
+                thread_id = self._resolve_thread(thread_key, cookie)
+                payload = _build_vybe_payload(thread_id, user_text, system_text, cookie)
                 resp = self.upstream.open_stream(cookie, thread_id, payload)
                 cookie.mark_success()
-                self.logger.info(f"cookie={cookie.name} thread={thread_id[:8]}... ok")
+                self.logger.info(
+                    f"cookie={cookie.name} thread={thread_id[:8]}... ok"
+                )
                 return resp
+
             except UpstreamAuthError as e:
                 cookie.mark_auth_failed(str(e))
+                self._clear_binding(thread_key, cookie.name)
                 self.logger.warn(f"cookie={cookie.name} auth failed: {e}")
                 last_error = ("auth_error", 401, str(e))
+
             except UpstreamQuotaError as e:
                 cookie.mark_quota_exhausted(str(e), self.cfg.cookie_cooldown)
                 self.logger.warn(f"cookie={cookie.name} quota: {e}")
                 last_error = ("insufficient_quota", 429, str(e))
+
+            except UpstreamThreadNotFoundError as e:
+                # 上游清理了 thread，清除绑定但不惩罚 cookie
+                self._clear_binding(thread_key, cookie.name)
+                self.logger.warn(
+                    f"cookie={cookie.name} thread not found, binding cleared"
+                )
+                last_error = ("thread_not_found", 404, str(e))
+                # 不标记 cookie 失败，继续尝试下一个 cookie
+                # （下一个 cookie 会走 _resolve_thread 创建新 thread）
+
             except UpstreamGenericError as e:
                 cookie.mark_transient_fail(
                     str(e), self.cfg.cookie_max_fails, self.cfg.cookie_fail_cooldown
@@ -541,8 +627,6 @@ class Handler(BaseHTTPRequestHandler):
         if last_error:
             code, status, msg = last_error
             self._err(status, code, f"all cookies failed; last: {msg}")
-        else:
-            self._err(503, "no_cookie", "all cookies exhausted")
         return None
 
     # -------- 流式 --------
@@ -678,7 +762,7 @@ def main():
 
     logger.info(f"starting vybe-proxy on {cfg.host}:{cfg.port}")
     logger.info(f"upstream = {cfg.upstream_url}")
-    logger.info(f"cookies = {[c.name for c in cfg.cookies]}")
+    logger.info(f"cookies = {[(c.name, c.agent_id, c.channel_id) for c in cfg.cookies]}")
 
     server = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     try:
