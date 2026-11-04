@@ -28,7 +28,8 @@ from typing import Any
 
 class Config:
     def __init__(self, path: str):
-        cp = configparser.ConfigParser()
+        # 关键：interpolation=None 关闭 % 插值，避免 session_token 里的 %2B/%3D 报错
+        cp = configparser.ConfigParser(interpolation=None)
         if not os.path.exists(path):
             raise SystemExit(f"config file not found: {path}")
         cp.read(path, encoding="utf-8")
